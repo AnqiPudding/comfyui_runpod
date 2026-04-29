@@ -1,5 +1,6 @@
 runpod_volume:
     base_path: /runpod-volume/models/
+    is_default: true
     audio_encoders: audio_encoders
     checkpoints: checkpoints
     clip: clip

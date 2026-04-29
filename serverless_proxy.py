@@ -123,6 +123,8 @@ async def proxy_request(request: Request, path: str) -> Response:
     body = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
+    headers.pop("origin", None)
+    headers.pop("referer", None)
 
     async with httpx.AsyncClient(timeout=RUNPOD_TIMEOUT) as client:
         try:

@@ -51,6 +51,7 @@ docker build -t comfyui-runpod .
 ```
 
 RunPod should mount persistent models at `/runpod-volume/models`, matching `extra_model_paths.yaml`.
+The RunPod model paths are marked as `is_default: true`, so custom nodes that call ComfyUI's model-folder APIs, including the Civitai downloader node, write to the persistent volume first.
 
 ## Build With GitHub Actions
 
@@ -79,3 +80,4 @@ Use that image name when creating the RunPod Serverless endpoint.
 - The worker returns base64 image data by default because RunPod Serverless responses are easiest for the local proxy to consume that way.
 - Set `RETURN_IMAGES=metadata` if you want the worker to return only ComfyUI image metadata.
 - `custom_nodes/model_delete` can delete model files when present in a workflow. Keep it only if you intentionally want that ability in the serverless image.
+- Do not leave this repo's `extra_model_paths.yaml` in a Windows local ComfyUI folder unless you intentionally want local paths like `D:\runpod-volume\models`.
