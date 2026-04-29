@@ -87,6 +87,12 @@ class CivitaiModelDownloader:
     CATEGORY = "model/download"
 
     def download_model(self, download_url, model_type, api_key="", file_name=""):
+        if os.name == "nt" and os.environ.get("ALLOW_LOCAL_MODEL_DOWNLOADS") != "1":
+            raise RuntimeError(
+                "Local Windows model downloads are disabled. Queue through the RunPod proxy, "
+                "or set ALLOW_LOCAL_MODEL_DOWNLOADS=1 if you intentionally want to download on this PC."
+            )
+
         if not download_url.startswith("http"):
             raise ValueError("Invalid download URL provided.")
 

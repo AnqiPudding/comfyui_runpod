@@ -184,6 +184,7 @@ async def websocket_proxy(websocket: WebSocket) -> None:
 
 
 @app.post("/prompt")
+@app.post("/api/prompt")
 async def prompt(request: Request) -> JSONResponse:
     if not RUNPOD_ENDPOINT or not RUNPOD_API_KEY:
         return JSONResponse(
@@ -243,11 +244,13 @@ async def prompt(request: Request) -> JSONResponse:
 
 
 @app.get("/history")
+@app.get("/api/history")
 async def history_all() -> JSONResponse:
     return JSONResponse(content=_histories)
 
 
 @app.get("/history/{prompt_id}")
+@app.get("/api/history/{prompt_id}")
 async def history(prompt_id: str) -> JSONResponse:
     if prompt_id in _histories:
         return JSONResponse(content=_histories[prompt_id])
@@ -256,6 +259,7 @@ async def history(prompt_id: str) -> JSONResponse:
 
 
 @app.get("/view")
+@app.get("/api/view")
 async def view(request: Request) -> Response:
     filename = request.query_params.get("filename", "")
     subfolder = request.query_params.get("subfolder", "")
