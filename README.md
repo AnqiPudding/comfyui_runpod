@@ -52,6 +52,27 @@ docker build -t comfyui-runpod .
 
 RunPod should mount persistent models at `/runpod-volume/models`, matching `extra_model_paths.yaml`.
 
+## Build With GitHub Actions
+
+This repo includes `.github/workflows/docker-publish.yml`. It builds the Docker image in GitHub Actions and pushes it to Docker Hub whenever `main` changes, or when you run the workflow manually.
+
+In GitHub, open this repo and add these repository secrets:
+
+- `DOCKERHUB_USERNAME`: your Docker Hub username
+- `DOCKERHUB_TOKEN`: a Docker Hub access token
+
+Optional repository variable:
+
+- `DOCKERHUB_IMAGE`: Docker Hub repository name. If omitted, the workflow uses this GitHub repo name, `comfyui_runpod`.
+
+Then open `Actions`, choose `Build and Publish Docker Image`, and run the workflow. The image will be pushed as:
+
+```text
+DOCKERHUB_USERNAME/comfyui_runpod:latest
+```
+
+Use that image name when creating the RunPod Serverless endpoint.
+
 ## Notes
 
 - The proxy sends the original ComfyUI `/prompt` JSON as `input.comfy_payload`, avoiding nested `prompt.prompt` payloads.
