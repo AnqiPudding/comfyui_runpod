@@ -40,7 +40,7 @@ Deployment overlay for running ComfyUI on RunPod Serverless while using a local 
 
 5. Open `http://127.0.0.1:8188`.
 
-The UI loads from local ComfyUI, but queueing a prompt sends the execution payload to RunPod Serverless.
+The UI loads from local ComfyUI, but queueing a prompt sends the execution payload to RunPod Serverless. The proxy submits jobs with RunPod's async `/run` operation and polls `/status/{job_id}`, which is better for long model downloads than holding a single `/runsync` request open.
 
 ## Build Image Later
 

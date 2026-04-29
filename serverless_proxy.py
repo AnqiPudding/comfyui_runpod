@@ -24,9 +24,10 @@ RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
 RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID", "")
 RUNPOD_ENDPOINT = os.getenv("RUNPOD_ENDPOINT", "")
 RUNPOD_TIMEOUT = float(os.getenv("RUNPOD_TIMEOUT", "900"))
+RUNPOD_POLL_INTERVAL = float(os.getenv("RUNPOD_POLL_INTERVAL", "5"))
 
 if not RUNPOD_ENDPOINT and RUNPOD_ENDPOINT_ID:
-    RUNPOD_ENDPOINT = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync"
+    RUNPOD_ENDPOINT = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}"
 
 _histories: dict[str, dict[str, Any]] = {}
 
@@ -36,6 +37,22 @@ def _unwrap_runpod_response(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(output, dict):
         return output
     return payload
+
+
+def _runpod_url(operation: str, job_id: str | None = None) -> str:
+    endpoint = RUNPOD_ENDPOINT.rstrip("/")
+
+    if endpoint.endswith("/runsync"):
+        endpoint = endpoint[: -len("/runsync")]
+    elif endpoint.endswith("/run"):
+        endpoint = endpoint[: -len("/run")]
+
+    if operation == "status":
+        if not job_id:
+            raise ValueError("job_id is required for RunPod status polling")
+        return f"{endpoint}/status/{job_id}"
+
+    return f"{endpoint}/{operation}"
 
 
 def _decode_image_data(data: str) -> bytes:
@@ -146,6 +163,31 @@ async def proxy_request(request: Request, path: str) -> Response:
     return Response(content=response.content, status_code=response.status_code, headers=response_headers)
 
 
+async def submit_runpod_job(client: httpx.AsyncClient, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+    response = await client.post(_runpod_url("run"), headers=headers, json=payload)
+    response.raise_for_status()
+    submitted = response.json()
+
+    job_id = submitted.get("id")
+    if not job_id:
+        return submitted
+
+    deadline = time.time() + RUNPOD_TIMEOUT
+
+    while time.time() < deadline:
+        status_response = await client.get(_runpod_url("status", job_id), headers=headers)
+        status_response.raise_for_status()
+        status_payload = status_response.json()
+        status = status_payload.get("status")
+
+        if status in {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}:
+            return status_payload
+
+        await asyncio.sleep(RUNPOD_POLL_INTERVAL)
+
+    raise TimeoutError(f"RunPod job {job_id} did not finish within {RUNPOD_TIMEOUT} seconds")
+
+
 @app.websocket("/ws")
 async def websocket_proxy(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -214,8 +256,7 @@ async def prompt(request: Request) -> JSONResponse:
 
     async with httpx.AsyncClient(timeout=RUNPOD_TIMEOUT) as client:
         try:
-            response = await client.post(RUNPOD_ENDPOINT, headers=headers, json=runpod_payload)
-            response.raise_for_status()
+            runpod_response = await submit_runpod_job(client, runpod_payload, headers)
         except httpx.HTTPStatusError as exc:
             return JSONResponse(
                 status_code=502,
@@ -224,8 +265,10 @@ async def prompt(request: Request) -> JSONResponse:
         except Exception as exc:
             return JSONResponse(status_code=500, content={"error": str(exc)})
 
-    runpod_response = response.json()
     runpod_output = _unwrap_runpod_response(runpod_response)
+
+    if runpod_response.get("status") in {"FAILED", "CANCELLED", "TIMED_OUT"}:
+        return JSONResponse(status_code=502, content={"error": "RunPod job failed", "runpod_response": runpod_response})
 
     if runpod_output.get("status") == "error":
         return JSONResponse(status_code=502, content={"error": runpod_output.get("error", "RunPod job failed")})
