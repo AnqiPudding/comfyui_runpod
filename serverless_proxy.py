@@ -12,14 +12,20 @@ from urllib.parse import urlencode
 import httpx
 import uvicorn
 import websockets
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
+
+load_dotenv()
 
 app = FastAPI()
 
 LOCAL_COMFY_URL = os.getenv("LOCAL_COMFY_URL", "http://127.0.0.1:8189").rstrip("/")
 LOCAL_OUTPUT_DIR = Path(os.getenv("LOCAL_OUTPUT_DIR", "output")).resolve()
+RUNPOD_OUTPUT_SUBFOLDER = os.getenv("RUNPOD_OUTPUT_SUBFOLDER", "runpod")
+RUNPOD_OUTPUT_DIR = (LOCAL_OUTPUT_DIR / RUNPOD_OUTPUT_SUBFOLDER).resolve()
+RUNPOD_HISTORY_INDEX = RUNPOD_OUTPUT_DIR / ".runpod_proxy_history.json"
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
 RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID", "")
 RUNPOD_ENDPOINT = os.getenv("RUNPOD_ENDPOINT", "")
@@ -30,6 +36,7 @@ if not RUNPOD_ENDPOINT and RUNPOD_ENDPOINT_ID:
     RUNPOD_ENDPOINT = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}"
 
 _histories: dict[str, dict[str, Any]] = {}
+_websockets: set[WebSocket] = set()
 
 
 def _unwrap_runpod_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -71,16 +78,87 @@ def _safe_output_path(subfolder: str, filename: str) -> Path:
     target_dir = (LOCAL_OUTPUT_DIR / subfolder).resolve()
     target = (target_dir / filename).resolve()
 
-    if not str(target).startswith(str(LOCAL_OUTPUT_DIR)):
+    try:
+        target.relative_to(LOCAL_OUTPUT_DIR)
+    except ValueError:
         raise ValueError("Requested output path escapes LOCAL_OUTPUT_DIR")
 
     return target
 
 
+def _load_history_index() -> None:
+    if RUNPOD_HISTORY_INDEX.is_file():
+        try:
+            loaded = json.loads(RUNPOD_HISTORY_INDEX.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                _histories.update(loaded)
+                return
+        except Exception as exc:
+            print(f"Could not load RunPod history index: {exc}", flush=True)
+
+    if not RUNPOD_OUTPUT_DIR.is_dir():
+        return
+
+    images: list[dict[str, str]] = []
+    for path in sorted(RUNPOD_OUTPUT_DIR.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        mime_type = mimetypes.guess_type(path.name)[0] or ""
+        if not mime_type.startswith("image/"):
+            continue
+        images.append({"filename": path.name, "subfolder": RUNPOD_OUTPUT_SUBFOLDER, "type": "output"})
+
+    if images:
+        prompt_id = "runpod-restored"
+        _histories[prompt_id] = _make_history(prompt_id, {"prompt": {}, "extra_data": {}}, images)
+        _save_history_index()
+
+
+def _save_history_index() -> None:
+    try:
+        RUNPOD_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        RUNPOD_HISTORY_INDEX.write_text(json.dumps(_histories, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"Could not save RunPod history index: {exc}", flush=True)
+
+
+async def _broadcast(event: str, data: dict[str, Any]) -> None:
+    message = {"type": event, "data": data}
+    stale: list[WebSocket] = []
+
+    for socket in list(_websockets):
+        try:
+            await socket.send_json(message)
+        except Exception:
+            stale.append(socket)
+
+    for socket in stale:
+        _websockets.discard(socket)
+
+
+async def _notify_prompt_finished(prompt_id: str, images: list[dict[str, str]]) -> None:
+    # Let the /prompt response reach the browser first, so the UI knows this prompt_id.
+    await asyncio.sleep(0.1)
+    await _broadcast("execution_start", {"prompt_id": prompt_id})
+    await _broadcast("executing", {"node": "runpod", "display_node": "runpod", "prompt_id": prompt_id})
+    await _broadcast(
+        "executed",
+        {
+            "node": "runpod",
+            "display_node": "runpod",
+            "output": {"images": images},
+            "prompt_id": prompt_id,
+        },
+    )
+    await _broadcast("execution_success", {"prompt_id": prompt_id})
+    await _broadcast("executing", {"node": None, "prompt_id": prompt_id})
+    await _broadcast("status", {"status": {"exec_info": {"queue_remaining": 0}}})
+
+
 def _save_runpod_images(prompt_id: str, runpod_output: dict[str, Any]) -> list[dict[str, str]]:
     saved: list[dict[str, str]] = []
     images = runpod_output.get("images") or []
-    subfolder = "runpod"
+    subfolder = RUNPOD_OUTPUT_SUBFOLDER
 
     for index, image in enumerate(images):
         if not isinstance(image, dict):
@@ -112,13 +190,16 @@ def _save_runpod_images(prompt_id: str, runpod_output: dict[str, Any]) -> list[d
 
 
 def _make_history(prompt_id: str, comfy_payload: dict[str, Any], images: list[dict[str, str]]) -> dict[str, Any]:
+    extra_data = comfy_payload.get("extra_data", {}) or {}
+    extra_data.setdefault("create_time", time.time())
+
     return {
         prompt_id: {
             "prompt": [
                 0,
                 prompt_id,
                 comfy_payload.get("prompt", {}),
-                comfy_payload.get("extra_data", {}),
+                extra_data,
                 [],
             ],
             "outputs": {
@@ -134,6 +215,65 @@ def _make_history(prompt_id: str, comfy_payload: dict[str, Any], images: list[di
             "meta": {},
         }
     }
+
+
+def _get_history_item(prompt_id: str) -> dict[str, Any] | None:
+    history = _histories.get(prompt_id)
+    if not history:
+        return None
+    return history.get(prompt_id)
+
+
+def _make_job(prompt_id: str, include_outputs: bool = False) -> dict[str, Any] | None:
+    history_item = _get_history_item(prompt_id)
+    if not history_item:
+        return None
+
+    prompt = history_item.get("prompt", [])
+    extra_data = prompt[3] if len(prompt) > 3 and isinstance(prompt[3], dict) else {}
+    outputs = history_item.get("outputs", {})
+    images = outputs.get("runpod", {}).get("images", [])
+    images_with_media = [
+        {
+            **image,
+            "nodeId": image.get("nodeId", "runpod"),
+            "mediaType": image.get("mediaType", "images"),
+        }
+        for image in images
+    ]
+    preview_output = None
+
+    if images_with_media:
+        preview_output = {
+            **images_with_media[0],
+        }
+
+    job = {
+        "id": prompt_id,
+        "status": "completed",
+        "priority": prompt[0] if prompt else 0,
+        "create_time": extra_data.get("create_time"),
+        "execution_end_time": time.time(),
+        "outputs_count": len(images_with_media),
+        "preview_output": preview_output,
+        "workflow_id": extra_data.get("extra_pnginfo", {}).get("workflow", {}).get("id"),
+    }
+
+    if include_outputs:
+        job["outputs"] = {"runpod": {"images": images_with_media}}
+        job["execution_status"] = history_item.get("status", {})
+        job["workflow"] = {
+            "prompt": prompt[2] if len(prompt) > 2 else {},
+            "extra_data": extra_data,
+        }
+
+    return {key: value for key, value in job.items() if value is not None}
+
+
+def _parse_status_filter(status_param: str | None) -> set[str]:
+    if not status_param:
+        return {"pending", "in_progress", "completed", "failed", "cancelled"}
+    return {status.strip().lower() for status in status_param.split(",") if status.strip()}
 
 
 async def proxy_request(request: Request, path: str) -> Response:
@@ -191,6 +331,7 @@ async def submit_runpod_job(client: httpx.AsyncClient, payload: dict[str, Any], 
 @app.websocket("/ws")
 async def websocket_proxy(websocket: WebSocket) -> None:
     await websocket.accept()
+    _websockets.add(websocket)
     query = urlencode(dict(websocket.query_params))
     target_url = LOCAL_COMFY_URL.replace("http://", "ws://").replace("https://", "wss://")
     target_url = f"{target_url}/ws"
@@ -223,6 +364,8 @@ async def websocket_proxy(websocket: WebSocket) -> None:
             await websocket.close()
         except RuntimeError:
             pass
+    finally:
+        _websockets.discard(websocket)
 
 
 @app.post("/prompt")
@@ -276,6 +419,8 @@ async def prompt(request: Request) -> JSONResponse:
     prompt_id = f"runpod-{uuid.uuid4()}"
     saved_images = _save_runpod_images(prompt_id, runpod_output)
     _histories[prompt_id] = _make_history(prompt_id, comfy_payload, saved_images)
+    _save_history_index()
+    asyncio.create_task(_notify_prompt_finished(prompt_id, saved_images))
 
     return JSONResponse(
         content={
@@ -301,6 +446,59 @@ async def history(prompt_id: str) -> JSONResponse:
     return JSONResponse(content={})
 
 
+@app.get("/api/jobs")
+async def jobs(request: Request) -> JSONResponse:
+    statuses = _parse_status_filter(request.query_params.get("status"))
+    workflow_id = request.query_params.get("workflow_id")
+    sort_order = request.query_params.get("sort_order", "desc").lower()
+
+    try:
+        limit = int(request.query_params.get("limit", "0") or "0")
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "limit must be an integer"})
+
+    try:
+        offset = max(0, int(request.query_params.get("offset", "0") or "0"))
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "offset must be an integer"})
+
+    all_jobs = []
+    if "completed" in statuses:
+        for prompt_id in _histories:
+            job = _make_job(prompt_id)
+            if not job:
+                continue
+            if workflow_id and job.get("workflow_id") != workflow_id:
+                continue
+            all_jobs.append(job)
+
+    all_jobs.sort(key=lambda job: job.get("create_time", 0), reverse=sort_order != "asc")
+    total = len(all_jobs)
+    page = all_jobs[offset:]
+    if limit > 0:
+        page = page[:limit]
+
+    return JSONResponse(
+        content={
+            "jobs": page,
+            "pagination": {
+                "offset": offset,
+                "limit": limit if limit > 0 else None,
+                "total": total,
+                "has_more": offset + len(page) < total,
+            },
+        }
+    )
+
+
+@app.get("/api/jobs/{prompt_id}")
+async def job(prompt_id: str) -> JSONResponse:
+    item = _make_job(prompt_id, include_outputs=True)
+    if not item:
+        return JSONResponse(status_code=404, content={"error": "job not found"})
+    return JSONResponse(content=item)
+
+
 @app.get("/view")
 @app.get("/api/view")
 async def view(request: Request) -> Response:
@@ -322,6 +520,7 @@ async def catch_all(request: Request, path: str) -> Response:
 
 
 if __name__ == "__main__":
+    _load_history_index()
     print("Starting local RunPod proxy on http://127.0.0.1:8188")
     print(f"Proxying UI metadata to local ComfyUI at {LOCAL_COMFY_URL}")
     uvicorn.run(app, host=os.getenv("PROXY_HOST", "127.0.0.1"), port=int(os.getenv("PROXY_PORT", "8188")))
