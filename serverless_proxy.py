@@ -151,7 +151,8 @@ def _load_history_index() -> None:
         try:
             loaded = json.loads(RUNPOD_HISTORY_INDEX.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
-                _histories.update(loaded)
+                for prompt_id, history_item in loaded.items():
+                    _histories[prompt_id] = _normalize_history_item(prompt_id, history_item)
                 return
         except Exception as exc:
             print(f"Could not load RunPod history index: {exc}", flush=True)
@@ -254,34 +255,40 @@ def _make_history(prompt_id: str, comfy_payload: dict[str, Any], images: list[di
     extra_data.setdefault("create_time", time.time())
 
     return {
-        prompt_id: {
-            "prompt": [
-                0,
-                prompt_id,
-                comfy_payload.get("prompt", {}),
-                extra_data,
-                [],
-            ],
-            "outputs": {
-                "runpod": {
-                    "images": images,
-                }
-            },
-            "status": {
-                "status_str": "success",
-                "completed": True,
-                "messages": [],
-            },
-            "meta": {},
-        }
+        "prompt": [
+            0,
+            prompt_id,
+            comfy_payload.get("prompt", {}),
+            extra_data,
+            [],
+        ],
+        "outputs": {
+            "runpod": {
+                "images": images,
+            }
+        },
+        "status": {
+            "status_str": "success",
+            "completed": True,
+            "messages": [],
+        },
+        "meta": {},
     }
+
+
+def _normalize_history_item(prompt_id: str, history_item: Any) -> dict[str, Any]:
+    if isinstance(history_item, dict) and prompt_id in history_item and isinstance(history_item[prompt_id], dict):
+        return history_item[prompt_id]
+    if isinstance(history_item, dict):
+        return history_item
+    return _make_history(prompt_id, {"prompt": {}, "extra_data": {}}, [])
 
 
 def _get_history_item(prompt_id: str) -> dict[str, Any] | None:
     history = _histories.get(prompt_id)
     if not history:
         return None
-    return history.get(prompt_id)
+    return _normalize_history_item(prompt_id, history)
 
 
 def _make_job(prompt_id: str, include_outputs: bool = False) -> dict[str, Any] | None:
@@ -507,8 +514,9 @@ async def history_all() -> JSONResponse:
 @app.get("/history/{prompt_id}")
 @app.get("/api/history/{prompt_id}")
 async def history(prompt_id: str) -> JSONResponse:
-    if prompt_id in _histories:
-        return JSONResponse(content=_histories[prompt_id])
+    history_item = _get_history_item(prompt_id)
+    if history_item:
+        return JSONResponse(content={prompt_id: history_item})
 
     return JSONResponse(content={})
 
