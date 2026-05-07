@@ -4,7 +4,7 @@ Deployment overlay for running ComfyUI on RunPod Serverless while using a local 
 
 ## What This Repo Contains
 
-- `Dockerfile`: builds a Python 3.13 RunPod worker image from the latest ComfyUI `main` plus the custom nodes used in the local setup.
+- `Dockerfile`: builds a Python 3.13 RunPod worker image from the latest default ComfyUI branch plus the custom nodes used in the local setup.
 - `runpod_handler.py`: starts ComfyUI inside the worker, forwards the real ComfyUI `/prompt` payload, waits for completion, and returns generated images.
 - `serverless_proxy.py`: local FastAPI proxy that serves the normal ComfyUI UI from a local CPU instance, intercepts `/prompt`, sends it to RunPod, saves returned images locally, and emulates `/history` and `/view` enough for the UI to show results.
 - `extra_model_paths.yaml`: points ComfyUI at `/runpod-volume/models`.

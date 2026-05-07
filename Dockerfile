@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 
 ARG CACHE_BUST=manual
-ARG COMFYUI_REF=main
+ARG COMFYUI_REF=
 ARG COMFYUI_MANAGER_REF=
 ARG COMFYUI_KJNODES_REF=
 ARG COMFYUI_QWENVL_REF=
@@ -36,8 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN echo "Cache bust: ${CACHE_BUST}" \
     && git clone https://github.com/Comfy-Org/ComfyUI.git "$COMFYUI_DIR" \
-    && cd "$COMFYUI_DIR" \
-    && git checkout "$COMFYUI_REF"
+    && if [ -n "$COMFYUI_REF" ]; then git -C "$COMFYUI_DIR" checkout "$COMFYUI_REF"; fi
 
 WORKDIR $COMFYUI_DIR
 
