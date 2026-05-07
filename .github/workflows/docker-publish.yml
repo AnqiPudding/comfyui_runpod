@@ -43,6 +43,8 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          build-args: |
+            CACHE_BUST=${{ github.run_id }}-${{ github.run_attempt }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

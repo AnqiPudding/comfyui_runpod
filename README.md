@@ -4,7 +4,7 @@ Deployment overlay for running ComfyUI on RunPod Serverless while using a local 
 
 ## What This Repo Contains
 
-- `Dockerfile`: builds a RunPod worker image from ComfyUI plus the custom nodes used in the local setup.
+- `Dockerfile`: builds a Python 3.13 RunPod worker image from the latest ComfyUI `main` plus the custom nodes used in the local setup.
 - `runpod_handler.py`: starts ComfyUI inside the worker, forwards the real ComfyUI `/prompt` payload, waits for completion, and returns generated images.
 - `serverless_proxy.py`: local FastAPI proxy that serves the normal ComfyUI UI from a local CPU instance, intercepts `/prompt`, sends it to RunPod, saves returned images locally, and emulates `/history` and `/view` enough for the UI to show results.
 - `extra_model_paths.yaml`: points ComfyUI at `/runpod-volume/models`.
@@ -24,23 +24,21 @@ Deployment overlay for running ComfyUI on RunPod Serverless while using a local 
    python -m pip install -r requirements-proxy.txt
    ```
 
-3. Set environment variables.
-
-   ```powershell
-   $env:RUNPOD_API_KEY="your-api-key"
-   $env:RUNPOD_ENDPOINT_ID="your-endpoint-id"
-   $env:LOCAL_COMFY_URL="http://127.0.0.1:8189"
-   ```
-
-4. Start the proxy.
+3. Start the proxy.
 
    ```powershell
    python serverless_proxy.py
    ```
 
-5. Open `http://127.0.0.1:8188`.
+4. Open `http://127.0.0.1:8188`.
 
-The UI loads from local ComfyUI, but queueing a prompt sends the execution payload to RunPod Serverless. The proxy submits jobs with RunPod's async `/run` operation and polls `/status/{job_id}`, which is better for long model downloads than holding a single `/runsync` request open.
+5. Click the floating `RunPod` button, or open `http://127.0.0.1:8188/runpod/settings`, and save:
+
+   - RunPod endpoint ID
+   - RunPod API key
+   - optional timeout / local ComfyUI URL
+
+The settings are saved only on your machine in `runpod_proxy_settings.json`, which is ignored by Git. The UI loads from local ComfyUI, but queueing a prompt sends the execution payload to RunPod Serverless. The proxy submits jobs with RunPod's async `/run` operation and polls `/status/{job_id}`, which is better for long model downloads than holding a single `/runsync` request open.
 
 ## Build Image Later
 
@@ -50,6 +48,7 @@ Build from this repo root:
 docker build -t comfyui-runpod .
 ```
 
+The image uses Python 3.13 and installs CUDA PyTorch wheels from `https://download.pytorch.org/whl/cu128`.
 RunPod should mount persistent models at `/runpod-volume/models`, matching `extra_model_paths.yaml`.
 The RunPod model paths are marked as `is_default: true`, so custom nodes that call ComfyUI's model-folder APIs, including the Civitai downloader node, write to the persistent volume first.
 
@@ -78,6 +77,7 @@ Use that image name when creating the RunPod Serverless endpoint.
 
 - The proxy sends the original ComfyUI `/prompt` JSON as `input.comfy_payload`, avoiding nested `prompt.prompt` payloads.
 - The worker returns base64 image data by default because RunPod Serverless responses are easiest for the local proxy to consume that way.
+- The local proxy persists RunPod results under `output/runpod/.runpod_proxy_history.json`, so completed outputs survive proxy restarts and can appear in the modern ComfyUI jobs/history UI.
 - Set `RETURN_IMAGES=metadata` if you want the worker to return only ComfyUI image metadata.
 - `custom_nodes/model_delete` can delete model files when present in a workflow. Keep it only if you intentionally want that ability in the serverless image.
 - Do not leave this repo's `extra_model_paths.yaml` in a Windows local ComfyUI folder unless you intentionally want local paths like `D:\runpod-volume\models`.
