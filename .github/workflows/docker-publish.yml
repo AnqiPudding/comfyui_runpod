@@ -4,6 +4,14 @@ on:
   push:
     branches:
       - main
+    paths:
+      - Dockerfile
+      - requirements-runpod.txt
+      - runpod_handler.py
+      - extra_model_paths.yaml
+      - custom_nodes/**
+      - .dockerignore
+      - .github/workflows/docker-publish.yml
   workflow_dispatch:
 
 env:
