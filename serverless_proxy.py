@@ -232,10 +232,15 @@ def _save_runpod_images(prompt_id: str, runpod_output: dict[str, Any]) -> list[d
         if not data:
             continue
 
-        if not filename:
+        if filename:
+            original_name = Path(filename).name
+            suffix = Path(original_name).suffix or _extension_for_mime(mime_type)
+            stem = Path(original_name).stem or "image"
+            filename = f"{prompt_id}_{index:03d}_{stem}{suffix}"
+        else:
             filename = f"{prompt_id}_{index:03d}{_extension_for_mime(mime_type)}"
 
-        target = _safe_output_path(subfolder, Path(filename).name)
+        target = _safe_output_path(subfolder, filename)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(_decode_image_data(data))
 
