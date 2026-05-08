@@ -307,19 +307,29 @@ async def _notify_prompt_finished(prompt_id: str, images: list[dict[str, str]]) 
     # Let the /prompt response reach the browser first, so the UI knows this prompt_id.
     await asyncio.sleep(0.1)
     await _broadcast("execution_start", {"prompt_id": prompt_id})
-    await _broadcast("executing", {"node": "runpod", "display_node": "runpod", "prompt_id": prompt_id})
-    await _broadcast(
-        "executed",
-        {
-            "node": "runpod",
-            "display_node": "runpod",
-            "output": {"images": images},
-            "prompt_id": prompt_id,
-        },
-    )
+    for node_id, node_images in _images_by_node(images).items():
+        await _broadcast("executing", {"node": node_id, "display_node": node_id, "prompt_id": prompt_id})
+        await _broadcast(
+            "executed",
+            {
+                "node": node_id,
+                "display_node": node_id,
+                "output": {"images": node_images},
+                "prompt_id": prompt_id,
+            },
+        )
     await _broadcast("execution_success", {"prompt_id": prompt_id})
     await _broadcast("executing", {"node": None, "prompt_id": prompt_id})
     await _broadcast("status", {"status": {"exec_info": {"queue_remaining": 0}}})
+
+
+def _images_by_node(images: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for image in images:
+        node_id = str(image.get("node_id") or image.get("nodeId") or "runpod")
+        display_image = {key: value for key, value in image.items() if key not in {"node_id", "nodeId", "mediaType"}}
+        grouped.setdefault(node_id, []).append(display_image)
+    return grouped
 
 
 def _save_runpod_images(prompt_id: str, runpod_output: dict[str, Any]) -> list[dict[str, str]]:
@@ -352,6 +362,7 @@ def _save_runpod_images(prompt_id: str, runpod_output: dict[str, Any]) -> list[d
 
         saved.append(
             {
+                "node_id": str(image.get("node_id") or image.get("nodeId") or "runpod"),
                 "filename": target.name,
                 "subfolder": subfolder,
                 "type": "output",
@@ -373,11 +384,7 @@ def _make_history(prompt_id: str, comfy_payload: dict[str, Any], images: list[di
             extra_data,
             [],
         ],
-        "outputs": {
-            "runpod": {
-                "images": images,
-            }
-        },
+        "outputs": {node_id: {"images": node_images} for node_id, node_images in _images_by_node(images).items()},
         "status": {
             "status_str": "success",
             "completed": True,
@@ -410,15 +417,18 @@ def _make_job(prompt_id: str, include_outputs: bool = False) -> dict[str, Any] |
     prompt = history_item.get("prompt", [])
     extra_data = prompt[3] if len(prompt) > 3 and isinstance(prompt[3], dict) else {}
     outputs = history_item.get("outputs", {})
-    images = outputs.get("runpod", {}).get("images", [])
-    images_with_media = [
-        {
-            **image,
-            "nodeId": image.get("nodeId", "runpod"),
-            "mediaType": image.get("mediaType", "images"),
-        }
-        for image in images
-    ]
+    images_with_media = []
+    for node_id, node_output in outputs.items():
+        if not isinstance(node_output, dict):
+            continue
+        for image in node_output.get("images", []):
+            images_with_media.append(
+                {
+                    **image,
+                    "nodeId": image.get("nodeId", node_id),
+                    "mediaType": image.get("mediaType", "images"),
+                }
+            )
     preview_output = None
 
     if images_with_media:
@@ -438,7 +448,11 @@ def _make_job(prompt_id: str, include_outputs: bool = False) -> dict[str, Any] |
     }
 
     if include_outputs:
-        job["outputs"] = {"runpod": {"images": images_with_media}}
+        grouped_outputs: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for image in images_with_media:
+            node_id = str(image.get("nodeId", "runpod"))
+            grouped_outputs.setdefault(node_id, {"images": []})["images"].append(image)
+        job["outputs"] = grouped_outputs
         job["execution_status"] = history_item.get("status", {})
         job["workflow"] = {
             "prompt": prompt[2] if len(prompt) > 2 else {},
