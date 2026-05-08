@@ -72,6 +72,18 @@ if errorlevel 1 (
   )
 )
 
+python -m pip show python-multipart >nul 2>nul
+if errorlevel 1 (
+  echo Installing upload support...
+  python -m pip install -r requirements-proxy.txt
+  if errorlevel 1 (
+    echo.
+    echo Failed to install upload support.
+    pause
+    exit /b 1
+  )
+)
+
 powershell -NoProfile -ExecutionPolicy Bypass -Command "if (Get-NetTCPConnection -LocalPort %PROXY_PORT% -State Listen -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
 if not errorlevel 1 (
   echo.

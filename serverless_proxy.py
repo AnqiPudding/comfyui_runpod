@@ -30,6 +30,7 @@ RUNPOD_POLL_INTERVAL = float(os.getenv("RUNPOD_POLL_INTERVAL", "5"))
 
 _histories: dict[str, dict[str, Any]] = {}
 _websockets: set[WebSocket] = set()
+_input_uploads: dict[tuple[str, str, str], dict[str, str]] = {}
 
 
 def _load_settings() -> dict[str, Any]:
@@ -128,10 +129,35 @@ def _decode_image_data(data: str) -> bytes:
     return base64.b64decode(data)
 
 
+def _encode_image_data(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
 def _extension_for_mime(mime_type: str | None, fallback: str = ".png") -> str:
     if not mime_type:
         return fallback
     return mimetypes.guess_extension(mime_type.split(";", 1)[0]) or fallback
+
+
+def _is_image_filename(value: str) -> bool:
+    mime_type = mimetypes.guess_type(value)[0] or ""
+    return mime_type.startswith("image/")
+
+
+def _normalize_upload_parts(filename: str, subfolder: str = "", folder_type: str = "input") -> tuple[str, str, str]:
+    normalized = Path(str(filename).replace("\\", "/"))
+    clean_filename = normalized.name
+    clean_subfolder = str(subfolder or "").strip().replace("\\", "/").strip("/")
+    inferred_subfolder = str(normalized.parent).replace("\\", "/").strip(".").strip("/")
+
+    if not clean_subfolder and inferred_subfolder:
+        clean_subfolder = inferred_subfolder
+
+    return str(folder_type or "input"), clean_subfolder, clean_filename
+
+
+def _input_upload_key(filename: str, subfolder: str = "", folder_type: str = "input") -> tuple[str, str, str]:
+    return _normalize_upload_parts(filename, subfolder, folder_type)
 
 
 def _safe_output_path(subfolder: str, filename: str) -> Path:
@@ -144,6 +170,86 @@ def _safe_output_path(subfolder: str, filename: str) -> Path:
         raise ValueError("Requested output path escapes LOCAL_OUTPUT_DIR")
 
     return target
+
+
+def _remember_uploaded_image(filename: str, subfolder: str, folder_type: str, data: bytes, mime_type: str | None) -> None:
+    folder_type, subfolder, filename = _normalize_upload_parts(filename, subfolder, folder_type)
+    if not filename or not data:
+        return
+
+    _input_uploads[(folder_type, subfolder, filename)] = {
+        "filename": filename,
+        "subfolder": subfolder,
+        "type": folder_type,
+        "data": _encode_image_data(data),
+        "mime_type": mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+    }
+
+
+async def _fetch_local_input_image(filename: str, subfolder: str, folder_type: str) -> dict[str, str] | None:
+    query = urlencode({"filename": filename, "subfolder": subfolder, "type": folder_type})
+    target_url = str(_current_settings().get("local_comfy_url", LOCAL_COMFY_URL)).rstrip("/")
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        try:
+            response = await client.get(f"{target_url}/view?{query}")
+            response.raise_for_status()
+        except Exception:
+            return None
+
+    return {
+        "filename": filename,
+        "subfolder": subfolder,
+        "type": folder_type,
+        "data": _encode_image_data(response.content),
+        "mime_type": response.headers.get("content-type") or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+    }
+
+
+def _referenced_input_images(comfy_payload: dict[str, Any]) -> set[tuple[str, str, str]]:
+    references: set[tuple[str, str, str]] = set()
+    prompt = comfy_payload.get("prompt", {})
+
+    if not isinstance(prompt, dict):
+        return references
+
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+
+        for key, value in inputs.items():
+            if not isinstance(value, str):
+                continue
+            if "image" not in key.lower() and "mask" not in key.lower():
+                continue
+            if _is_image_filename(value):
+                references.add(_input_upload_key(value, folder_type="input"))
+
+    return references
+
+
+async def _collect_input_images_for_runpod(comfy_payload: dict[str, Any]) -> list[dict[str, str]]:
+    references = _referenced_input_images(comfy_payload)
+    if not references:
+        return list(_input_uploads.values())
+
+    images: list[dict[str, str]] = []
+    for key in references:
+        uploaded = _input_uploads.get(key)
+        if uploaded:
+            images.append(uploaded)
+            continue
+
+        folder_type, subfolder, filename = key
+        fetched = await _fetch_local_input_image(filename, subfolder, folder_type)
+        if fetched:
+            _input_uploads[key] = fetched
+            images.append(fetched)
+
+    return images
 
 
 def _load_history_index() -> None:
@@ -376,6 +482,51 @@ async def proxy_request(request: Request, path: str) -> Response:
     return Response(content=response.content, status_code=response.status_code, headers=response_headers)
 
 
+@app.post("/upload/image")
+@app.post("/api/upload/image")
+async def upload_image(request: Request) -> Response:
+    body = await request.body()
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    headers.pop("origin", None)
+    headers.pop("referer", None)
+
+    target_url = str(_current_settings().get("local_comfy_url", LOCAL_COMFY_URL)).rstrip("/")
+    async with httpx.AsyncClient(timeout=RUNPOD_TIMEOUT) as client:
+        try:
+            response = await client.post(
+                f"{target_url}/upload/image",
+                headers=headers,
+                content=body,
+                params=request.query_params,
+            )
+        except httpx.ConnectError:
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"Could not connect to local ComfyUI at {LOCAL_COMFY_URL}"},
+            )
+
+    if response.is_success:
+        try:
+            response_payload = response.json()
+            form = await request.form()
+            upload = form.get("image")
+            if upload is not None and hasattr(upload, "read"):
+                await upload.seek(0)
+                data = await upload.read()
+                filename = str(response_payload.get("name") or getattr(upload, "filename", ""))
+                subfolder = str(response_payload.get("subfolder") or form.get("subfolder") or "")
+                folder_type = str(response_payload.get("type") or form.get("type") or "input")
+                mime_type = getattr(upload, "content_type", None)
+                _remember_uploaded_image(filename, subfolder, folder_type, data, mime_type)
+        except Exception as exc:
+            print(f"Could not cache uploaded input image for RunPod: {exc}", flush=True)
+
+    excluded = {"content-encoding", "transfer-encoding", "connection"}
+    response_headers = {k: v for k, v in response.headers.items() if k.lower() not in excluded}
+    return Response(content=response.content, status_code=response.status_code, headers=response_headers)
+
+
 async def submit_runpod_job(client: httpx.AsyncClient, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
     response = await client.post(_runpod_url("run"), headers=headers, json=payload)
     response.raise_for_status()
@@ -466,9 +617,11 @@ async def prompt(request: Request) -> JSONResponse:
     if "prompt" not in comfy_payload:
         return JSONResponse(status_code=400, content={"error": "ComfyUI payload is missing 'prompt'"})
 
+    input_images = await _collect_input_images_for_runpod(comfy_payload)
     runpod_payload = {
         "input": {
             "comfy_payload": comfy_payload,
+            "input_images": input_images,
         }
     }
     headers = {

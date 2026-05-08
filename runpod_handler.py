@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 import runpod
@@ -20,6 +21,10 @@ STARTUP_TIMEOUT = int(os.getenv("COMFY_STARTUP_TIMEOUT", "180"))
 POLL_INTERVAL = float(os.getenv("COMFY_POLL_INTERVAL", "1"))
 JOB_TIMEOUT = int(os.getenv("COMFY_JOB_TIMEOUT", "900"))
 RETURN_IMAGES = os.getenv("RETURN_IMAGES", "base64").lower()
+
+COMFY_INPUT_DIR = Path(COMFYUI_DIR) / "input"
+COMFY_OUTPUT_DIR = Path(COMFYUI_DIR) / "output"
+COMFY_TEMP_DIR = Path(COMFYUI_DIR) / "temp"
 
 _comfy_process: subprocess.Popen | None = None
 
@@ -100,6 +105,52 @@ def _normalize_prompt_payload(job_input: dict[str, Any]) -> dict[str, Any]:
     raise ValueError("Expected input.comfy_payload, input.prompt, or input.workflow")
 
 
+def _decode_image_data(data: str) -> bytes:
+    if "," in data and data.strip().lower().startswith("data:"):
+        data = data.split(",", 1)[1]
+    return base64.b64decode(data)
+
+
+def _safe_file_path(root: Path, subfolder: str, filename: str) -> Path:
+    target_dir = (root / str(subfolder or "").replace("\\", "/").strip("/")).resolve()
+    target = (target_dir / Path(str(filename).replace("\\", "/")).name).resolve()
+
+    try:
+        target.relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"Input image path escapes {root}") from exc
+
+    return target
+
+
+def restore_input_images(job_input: dict[str, Any]) -> None:
+    input_images = job_input.get("input_images") or []
+    if not isinstance(input_images, list):
+        return
+
+    roots = {
+        "input": COMFY_INPUT_DIR,
+        "temp": COMFY_TEMP_DIR,
+        "output": COMFY_OUTPUT_DIR,
+    }
+
+    for image in input_images:
+        if not isinstance(image, dict):
+            continue
+
+        filename = image.get("filename")
+        data = image.get("data") or image.get("base64")
+        if not filename or not data:
+            continue
+
+        folder_type = str(image.get("type") or "input")
+        root = roots.get(folder_type, COMFY_INPUT_DIR)
+        target = _safe_file_path(root, str(image.get("subfolder") or ""), str(filename))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(_decode_image_data(str(data)))
+        print(f"Restored input image: {target}", flush=True)
+
+
 def queue_prompt(comfy_payload: dict[str, Any]) -> dict[str, Any]:
     if "prompt" not in comfy_payload:
         raise ValueError("ComfyUI payload must contain a 'prompt' field")
@@ -163,6 +214,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         start_comfyui()
 
         job_input = job.get("input") or {}
+        restore_input_images(job_input)
         comfy_payload = _normalize_prompt_payload(job_input)
 
         print("Queuing workflow...", flush=True)

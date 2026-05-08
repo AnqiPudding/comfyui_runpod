@@ -76,6 +76,7 @@ Use that image name when creating the RunPod Serverless endpoint.
 ## Notes
 
 - The proxy sends the original ComfyUI `/prompt` JSON as `input.comfy_payload`, avoiding nested `prompt.prompt` payloads.
+- Uploaded input images are captured by the local proxy and sent as `input.input_images`; the serverless worker restores them into ComfyUI's `input` folder before queueing the workflow.
 - The worker returns base64 image data by default because RunPod Serverless responses are easiest for the local proxy to consume that way.
 - The local proxy persists RunPod results under `output/runpod/.runpod_proxy_history.json`, so completed outputs survive proxy restarts and can appear in the modern ComfyUI jobs/history UI.
 - Set `RETURN_IMAGES=metadata` if you want the worker to return only ComfyUI image metadata.

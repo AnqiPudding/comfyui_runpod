@@ -35,6 +35,18 @@ if errorlevel 1 (
   )
 )
 
+python -m pip show python-multipart >nul 2>nul
+if errorlevel 1 (
+  echo Installing upload support...
+  python -m pip install -r requirements-proxy.txt
+  if errorlevel 1 (
+    echo.
+    echo Failed to install upload support.
+    pause
+    exit /b 1
+  )
+)
+
 echo Starting server. Close this window to stop the proxy.
 echo.
 python serverless_proxy.py
