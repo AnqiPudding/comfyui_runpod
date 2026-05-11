@@ -209,28 +209,31 @@ def collect_images(history: dict[str, Any]) -> list[dict[str, Any]]:
     return images
 
 
+def run_comfy_job(job_input: dict[str, Any]) -> dict[str, Any]:
+    start_comfyui()
+    restore_input_images(job_input)
+    comfy_payload = _normalize_prompt_payload(job_input)
+
+    print("Queuing workflow...", flush=True)
+    prompt_response = queue_prompt(comfy_payload)
+    prompt_id = prompt_response["prompt_id"]
+
+    print(f"Workflow queued. Prompt ID: {prompt_id}", flush=True)
+    history = get_history(prompt_id)
+    images = collect_images(history)
+
+    return {
+        "status": "success",
+        "prompt_id": prompt_id,
+        "images": images,
+        "history": history if os.getenv("RETURN_HISTORY", "0") == "1" else None,
+    }
+
+
 def handler(job: dict[str, Any]) -> dict[str, Any]:
     try:
-        start_comfyui()
-
         job_input = job.get("input") or {}
-        restore_input_images(job_input)
-        comfy_payload = _normalize_prompt_payload(job_input)
-
-        print("Queuing workflow...", flush=True)
-        prompt_response = queue_prompt(comfy_payload)
-        prompt_id = prompt_response["prompt_id"]
-
-        print(f"Workflow queued. Prompt ID: {prompt_id}", flush=True)
-        history = get_history(prompt_id)
-        images = collect_images(history)
-
-        return {
-            "status": "success",
-            "prompt_id": prompt_id,
-            "images": images,
-            "history": history if os.getenv("RETURN_HISTORY", "0") == "1" else None,
-        }
+        return run_comfy_job(job_input)
     except Exception as exc:
         print(f"RunPod handler error: {exc}", flush=True)
         return {"status": "error", "error": str(exc)}

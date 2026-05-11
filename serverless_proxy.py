@@ -35,9 +35,14 @@ _input_uploads: dict[tuple[str, str, str], dict[str, str]] = {}
 
 def _load_settings() -> dict[str, Any]:
     settings: dict[str, Any] = {
+        "provider": "runpod",
         "runpod_api_key": "",
         "runpod_endpoint_id": "",
         "runpod_endpoint": "",
+        "vast_api_key": "",
+        "vast_endpoint_name": "",
+        "vast_route": "/generate",
+        "vast_cost": 1.0,
         "runpod_timeout": RUNPOD_TIMEOUT,
         "runpod_poll_interval": RUNPOD_POLL_INTERVAL,
         "local_comfy_url": LOCAL_COMFY_URL,
@@ -78,9 +83,14 @@ def _current_settings() -> dict[str, Any]:
 
     return {
         **settings,
+        "provider": str(settings.get("provider") or "runpod").lower(),
         "runpod_endpoint": endpoint,
         "runpod_endpoint_id": endpoint_id,
         "runpod_api_key": str(settings.get("runpod_api_key", "")),
+        "vast_api_key": str(settings.get("vast_api_key", "")),
+        "vast_endpoint_name": str(settings.get("vast_endpoint_name", "")),
+        "vast_route": str(settings.get("vast_route") or "/generate"),
+        "vast_cost": float(settings.get("vast_cost") or 1.0),
         "runpod_timeout": float(settings.get("runpod_timeout") or RUNPOD_TIMEOUT),
         "runpod_poll_interval": float(settings.get("runpod_poll_interval") or RUNPOD_POLL_INTERVAL),
     }
@@ -88,11 +98,20 @@ def _current_settings() -> dict[str, Any]:
 
 def _public_settings() -> dict[str, Any]:
     settings = _current_settings()
+    provider = settings.get("provider", "runpod")
+    runpod_configured = bool(settings.get("runpod_api_key") and settings.get("runpod_endpoint"))
+    vast_configured = bool(settings.get("vast_api_key") and settings.get("vast_endpoint_name"))
     return {
-        "configured": bool(settings.get("runpod_api_key") and settings.get("runpod_endpoint")),
+        "configured": vast_configured if provider == "vast" else runpod_configured,
+        "provider": provider,
         "runpod_endpoint_id": settings.get("runpod_endpoint_id", ""),
         "runpod_endpoint": settings.get("runpod_endpoint", ""),
         "runpod_api_key_masked": _mask_secret(settings.get("runpod_api_key", "")),
+        "vast_endpoint_name": settings.get("vast_endpoint_name", ""),
+        "vast_route": settings.get("vast_route", "/generate"),
+        "vast_api_key_masked": _mask_secret(settings.get("vast_api_key", "")),
+        "vast_configured": vast_configured,
+        "runpod_configured": runpod_configured,
         "runpod_timeout": settings.get("runpod_timeout"),
         "runpod_poll_interval": settings.get("runpod_poll_interval"),
         "local_comfy_url": settings.get("local_comfy_url", LOCAL_COMFY_URL),
@@ -567,6 +586,34 @@ async def submit_runpod_job(client: httpx.AsyncClient, payload: dict[str, Any], 
     raise TimeoutError(f"RunPod job {job_id} did not finish within {settings.get('runpod_timeout')} seconds")
 
 
+async def submit_vast_job(payload: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from vastai import Serverless
+    except ImportError as exc:
+        raise RuntimeError("Install Vast support with: python -m pip install -r requirements-proxy.txt") from exc
+
+    api_key = str(settings.get("vast_api_key", ""))
+    endpoint_name = str(settings.get("vast_endpoint_name", ""))
+    route = str(settings.get("vast_route") or "/generate")
+    cost = float(settings.get("vast_cost") or 1.0)
+
+    if not route.startswith("/"):
+        route = f"/{route}"
+
+    client = Serverless(api_key=api_key)
+    try:
+        endpoint = await client.get_endpoint(name=endpoint_name)
+        result = await endpoint.request(route, payload, cost=cost)
+    finally:
+        await client.close()
+
+    if isinstance(result, dict) and "response" in result and isinstance(result["response"], dict):
+        return result["response"]
+    if isinstance(result, dict):
+        return result
+    raise RuntimeError(f"Unexpected Vast response: {result!r}")
+
+
 @app.websocket("/ws")
 async def websocket_proxy(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -612,10 +659,17 @@ async def websocket_proxy(websocket: WebSocket) -> None:
 @app.post("/api/prompt")
 async def prompt(request: Request) -> JSONResponse:
     settings = _current_settings()
+    provider = str(settings.get("provider", "runpod")).lower()
     runpod_api_key = str(settings.get("runpod_api_key", ""))
     runpod_endpoint = str(settings.get("runpod_endpoint", ""))
 
-    if not runpod_endpoint or not runpod_api_key:
+    if provider == "vast":
+        if not settings.get("vast_endpoint_name") or not settings.get("vast_api_key"):
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Vast endpoint name and API key must be configured at /runpod/settings"},
+            )
+    elif not runpod_endpoint or not runpod_api_key:
         return JSONResponse(
             status_code=500,
             content={
@@ -632,27 +686,29 @@ async def prompt(request: Request) -> JSONResponse:
         return JSONResponse(status_code=400, content={"error": "ComfyUI payload is missing 'prompt'"})
 
     input_images = await _collect_input_images_for_runpod(comfy_payload)
-    runpod_payload = {
-        "input": {
-            "comfy_payload": comfy_payload,
-            "input_images": input_images,
-        }
-    }
-    headers = {
-        "Authorization": f"Bearer {runpod_api_key}",
-        "Content-Type": "application/json",
+    endpoint_payload = {
+        "comfy_payload": comfy_payload,
+        "input_images": input_images,
     }
 
-    async with httpx.AsyncClient(timeout=float(settings.get("runpod_timeout") or RUNPOD_TIMEOUT)) as client:
-        try:
-            runpod_response = await submit_runpod_job(client, runpod_payload, headers)
-        except httpx.HTTPStatusError as exc:
-            return JSONResponse(
-                status_code=502,
-                content={"error": f"RunPod HTTP {exc.response.status_code}", "body": exc.response.text},
-            )
-        except Exception as exc:
-            return JSONResponse(status_code=500, content={"error": str(exc)})
+    try:
+        if provider == "vast":
+            runpod_response = await submit_vast_job(endpoint_payload, settings)
+        else:
+            runpod_payload = {"input": endpoint_payload}
+            headers = {
+                "Authorization": f"Bearer {runpod_api_key}",
+                "Content-Type": "application/json",
+            }
+            async with httpx.AsyncClient(timeout=float(settings.get("runpod_timeout") or RUNPOD_TIMEOUT)) as client:
+                runpod_response = await submit_runpod_job(client, runpod_payload, headers)
+    except httpx.HTTPStatusError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={"error": f"RunPod HTTP {exc.response.status_code}", "body": exc.response.text},
+        )
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
     runpod_output = _unwrap_runpod_response(runpod_response)
 
@@ -769,7 +825,7 @@ async def runpod_settings_page() -> HTMLResponse:
     p {{ color: #bbb; line-height: 1.5; }}
     form {{ display: grid; gap: 18px; margin-top: 28px; }}
     label {{ display: grid; gap: 8px; font-weight: 650; }}
-    input {{ background: #1b1b1b; border: 1px solid #444; color: white; padding: 12px; border-radius: 6px; font: inherit; }}
+    input, select {{ background: #1b1b1b; border: 1px solid #444; color: white; padding: 12px; border-radius: 6px; font: inherit; }}
     button, a.button {{ width: fit-content; border: 0; border-radius: 6px; background: #6f5cff; color: white; padding: 10px 16px; font-weight: 700; text-decoration: none; cursor: pointer; }}
     .row {{ display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }}
     .status {{ border: 1px solid #333; border-radius: 8px; padding: 14px; background: #181818; margin-top: 18px; }}
@@ -785,14 +841,29 @@ async def runpod_settings_page() -> HTMLResponse:
       Current key: <code>{html.escape(str(public["runpod_api_key_masked"]))}</code>
     </div>
     <form id="settings-form">
+      <label>Provider
+        <select name="provider">
+          <option value="runpod" {"selected" if settings.get("provider") != "vast" else ""}>RunPod</option>
+          <option value="vast" {"selected" if settings.get("provider") == "vast" else ""}>Vast.ai</option>
+        </select>
+      </label>
       <label>Endpoint ID
         <input name="runpod_endpoint_id" autocomplete="off" value="{html.escape(str(settings.get("runpod_endpoint_id", "")))}" placeholder="your-endpoint-id">
       </label>
-      <label>API Key
+      <label>RunPod API Key
         <input name="runpod_api_key" autocomplete="off" type="password" value="" placeholder="leave blank to keep current key">
       </label>
       <label>Full Endpoint URL Override
         <input name="runpod_endpoint" autocomplete="off" value="{html.escape(str(settings.get("runpod_endpoint", "")))}" placeholder="https://api.runpod.ai/v2/endpoint-id">
+      </label>
+      <label>Vast Endpoint Name
+        <input name="vast_endpoint_name" autocomplete="off" value="{html.escape(str(settings.get("vast_endpoint_name", "")))}" placeholder="your Vast serverless endpoint name">
+      </label>
+      <label>Vast API Key
+        <input name="vast_api_key" autocomplete="off" type="password" value="" placeholder="leave blank to keep current key">
+      </label>
+      <label>Vast Route
+        <input name="vast_route" autocomplete="off" value="{html.escape(str(settings.get("vast_route", "/generate")))}">
       </label>
       <label>Local ComfyUI URL
         <input name="local_comfy_url" autocomplete="off" value="{html.escape(str(settings.get("local_comfy_url", LOCAL_COMFY_URL)))}">
@@ -803,6 +874,9 @@ async def runpod_settings_page() -> HTMLResponse:
         </label>
         <label>Poll interval seconds
           <input name="runpod_poll_interval" type="number" min="1" value="{html.escape(str(settings.get("runpod_poll_interval", RUNPOD_POLL_INTERVAL)))}">
+        </label>
+        <label>Vast cost
+          <input name="vast_cost" type="number" min="0.1" step="0.1" value="{html.escape(str(settings.get("vast_cost", 1.0)))}">
         </label>
       </div>
       <div class="row">
@@ -819,6 +893,7 @@ async def runpod_settings_page() -> HTMLResponse:
       const payload = Object.fromEntries(new FormData(form).entries());
       payload.runpod_timeout = Number(payload.runpod_timeout || 900);
       payload.runpod_poll_interval = Number(payload.runpod_poll_interval || 5);
+      payload.vast_cost = Number(payload.vast_cost || 1);
       const response = await fetch('/runpod/settings', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
@@ -842,9 +917,14 @@ async def save_runpod_settings(request: Request) -> JSONResponse:
 
     current = _current_settings()
     allowed = {
+        "provider",
         "runpod_api_key",
         "runpod_endpoint_id",
         "runpod_endpoint",
+        "vast_api_key",
+        "vast_endpoint_name",
+        "vast_route",
+        "vast_cost",
         "runpod_timeout",
         "runpod_poll_interval",
         "local_comfy_url",
@@ -852,7 +932,7 @@ async def save_runpod_settings(request: Request) -> JSONResponse:
     next_settings = {key: current.get(key, "") for key in allowed}
     for key in allowed:
         if key in payload:
-            if key == "runpod_api_key" and payload[key] == "":
+            if key in {"runpod_api_key", "vast_api_key"} and payload[key] == "":
                 continue
             next_settings[key] = payload[key]
 

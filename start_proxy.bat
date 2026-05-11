@@ -47,6 +47,18 @@ if errorlevel 1 (
   )
 )
 
+python -m pip show vastai >nul 2>nul
+if errorlevel 1 (
+  echo Installing Vast.ai proxy support...
+  python -m pip install -r requirements-proxy.txt
+  if errorlevel 1 (
+    echo.
+    echo Failed to install Vast.ai proxy support.
+    pause
+    exit /b 1
+  )
+)
+
 echo Starting server. Close this window to stop the proxy.
 echo.
 python serverless_proxy.py

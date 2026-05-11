@@ -68,11 +68,13 @@ RUN set -eux; \
     maybe_checkout custom_nodes/was-node-suite-comfyui "$WAS_NODE_SUITE_REF"
 
 COPY custom_nodes/ /workspace/ComfyUI/custom_nodes/
-COPY extra_model_paths.yaml runpod_handler.py /workspace/ComfyUI/
+COPY extra_model_paths.yaml runpod_handler.py vast_comfy_server.py vast_worker.py /workspace/ComfyUI/
+COPY start-server.sh start-vast.sh /workspace/
 
 RUN set -eux; \
     for req in custom_nodes/*/requirements.txt; do \
         if [ -f "$req" ]; then pip install -r "$req"; fi; \
-    done
+    done; \
+    chmod +x /workspace/start-server.sh /workspace/start-vast.sh
 
-CMD ["python", "/workspace/ComfyUI/runpod_handler.py"]
+CMD ["/workspace/start-server.sh"]

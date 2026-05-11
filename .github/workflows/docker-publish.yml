@@ -8,6 +8,10 @@ on:
       - Dockerfile
       - requirements-runpod.txt
       - runpod_handler.py
+      - vast_comfy_server.py
+      - vast_worker.py
+      - start-server.sh
+      - start-vast.sh
       - extra_model_paths.yaml
       - custom_nodes/**
       - .dockerignore

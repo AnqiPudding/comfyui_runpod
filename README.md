@@ -82,3 +82,16 @@ Use that image name when creating the RunPod Serverless endpoint.
 - Set `RETURN_IMAGES=metadata` if you want the worker to return only ComfyUI image metadata.
 - `custom_nodes/model_delete` can delete model files when present in a workflow. Keep it only if you intentionally want that ability in the serverless image.
 - Do not leave this repo's `extra_model_paths.yaml` in a Windows local ComfyUI folder unless you intentionally want local paths like `D:\runpod-volume\models`.
+
+## Vast.ai Serverless
+
+The Docker image can run in either mode:
+
+- RunPod: default, or `SERVERLESS_PROVIDER=runpod`
+- Vast.ai: set `SERVERLESS_PROVIDER=vast`
+
+For Vast.ai, the image starts a local ComfyUI-backed model server on port `18000` and a Vast PyWorker route at `/generate`. In the local proxy settings page, choose `Vast.ai`, enter your Vast API key, endpoint name, and keep the route as `/generate`.
+
+Model storage is controlled by `MODEL_VOLUME_DIR` or `VAST_MODEL_DIR`. If neither is set, the image uses `/data/models` unless `/runpod-volume` exists. The startup script symlinks that model directory to `/runpod-volume/models`, so existing ComfyUI extra model paths and downloader nodes still write to persistent model storage.
+
+Vast.ai does not provide a direct equivalent to RunPod cross-host network volumes. Its migration docs map RunPod network volumes to machine-local disk, and recommend object storage for data that must persist across different machines.
