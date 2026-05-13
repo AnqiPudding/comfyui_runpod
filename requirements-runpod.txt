@@ -1,5 +1,2 @@
 runpod>=1.7.0
 requests>=2.31.0
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-vastai>=0.3.0
